@@ -1,5 +1,7 @@
 # Kvazar
 
+This is a fork of [winterdemise/kvazar](https://github.com/wintersdemise/kvazar)
+
 Kvazar is a lightweight Discord music bot written in Go. It focuses on fast response times, a minimal player aesthetic, and first-class support for YouTube and SoundCloud audio sources.
 
 ## Features
