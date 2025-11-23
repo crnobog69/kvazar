@@ -46,7 +46,8 @@ func (r *Resolver) Resolve(ctx context.Context, query, requestedBy, channelID st
 		"--ignore-errors",
 		"--dump-json",
 		"--no-warnings",
-		"-f", "bestaudio/best",
+		"-f", "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+		"--audio-quality", "0",
 		realQuery,
 	}
 
@@ -137,9 +138,9 @@ func prepareQuery(q string) string {
 	}
 	lower := strings.ToLower(trimmed)
 	if strings.HasPrefix(lower, "sc ") {
-		return "scsearch1:" + strings.TrimSpace(trimmed[3:])
+		return "scsearch:" + strings.TrimSpace(trimmed[3:])
 	}
-	return "ytsearch1:" + trimmed
+	return "ytsearch:" + trimmed
 }
 
 func looksLikeURL(value string) bool {

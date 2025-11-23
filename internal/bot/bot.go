@@ -70,13 +70,18 @@ func (k *Kvazar) Open(ctx context.Context) error {
         return err
     }
 
-    if k.status != "" {
-        _ = k.session.UpdateListeningStatus(k.status)
-    } else {
-        _ = k.session.UpdateListeningStatus("/play")
-    }
-
-    return nil
+	// Set Do Not Disturb status
+	_ = k.session.UpdateStatusComplex(discordgo.UpdateStatusData{
+		Status: "dnd",
+		Activities: []*discordgo.Activity{
+			{
+				Name: pickOrDefault(k.status, "/play"),
+				Type: discordgo.ActivityTypeListening,
+			},
+		},
+	})
+	
+	return nil
 }
 
 // Close deregisters commands and closes the Discord session.
@@ -125,53 +130,60 @@ func (k *Kvazar) onReady(_ *discordgo.Session, event *discordgo.Ready) {
 }
 
 func (k *Kvazar) onInteractionCreate(s *discordgo.Session, ic *discordgo.InteractionCreate) {
-    if ic.Type != discordgo.InteractionApplicationCommand {
-        return
-    }
-
-    switch ic.ApplicationCommandData().Name {
-    case commandPlay:
-        k.handlePlay(ic)
-    case commandSkip:
-        k.handleSkip(ic)
-    case commandLoop:
-        k.handleLoop(ic)
+    switch ic.Type {
+    case discordgo.InteractionApplicationCommand:
+        switch ic.ApplicationCommandData().Name {
+        case commandPlay:
+            k.handlePlay(ic)
+        case commandPlayer:
+            k.handlePlayer(ic)
+        case commandPause:
+            k.handlePause(ic)
+        case commandStop:
+            k.handleStop(ic)
+        case commandSkip:
+            k.handleSkip(ic)
+        case commandLoop:
+            k.handleLoop(ic)
+        }
+    case discordgo.InteractionMessageComponent:
+        k.handleButtonClick(ic)
     }
 }
 
 func (k *Kvazar) handlePlay(ic *discordgo.InteractionCreate) {
     data := ic.ApplicationCommandData()
-    if len(data.Options) == 0 {
-        k.respondError(ic, "Please provide a query or URL to play.")
-        return
-    }
+	if len(data.Options) == 0 {
+		k.respondError(ic, "Молим те унеси упит или URL адресу.")
+		return
+	}
 
-    query := strings.TrimSpace(data.Options[0].StringValue())
-    if query == "" {
-        k.respondError(ic, "Please provide a non-empty query.")
-        return
-    }
+	query := strings.TrimSpace(data.Options[0].StringValue())
+	if query == "" {
+		k.respondError(ic, "Молим те унеси упит.")
+		return
+	}
 
-    guildID := ic.GuildID
-    if guildID == "" {
-        k.respondError(ic, "This command can only be used within a server.")
-        return
-    }
+	guildID := ic.GuildID
+	if guildID == "" {
+		k.respondError(ic, "Ова команда се може користити само на серверу.")
+		return
+	}
 
-    userID := ic.Member.User.ID
-    voiceChannel, err := locateVoiceChannel(k.session, guildID, userID)
-    if err != nil {
-        k.respondError(ic, "You must be connected to a voice channel to use /play.")
-        return
-    }
-
-    if err := k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
-        Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-        Data: &discordgo.InteractionResponseData{
-            Content: "Preparing your track…",
-            Flags:   discordgo.MessageFlagsEphemeral,
-        },
-    }); err != nil {
+	userID := ic.Member.User.ID
+	voiceChannel, err := locateVoiceChannel(k.session, guildID, userID)
+	if err != nil {
+		k.respondError(ic, "Мораш бити повезан на гласовни канал да би користио /play.")
+		return
+	}
+	
+	if err := k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "Припремам песму…",
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	}); err != nil {
         log.Printf("failed to acknowledge interaction: %v", err)
         return
     }
@@ -186,7 +198,7 @@ func (k *Kvazar) fulfilPlay(ic *discordgo.InteractionCreate, query, voiceChannel
     player := k.getPlayer(guildID)
 
     if err := player.EnsureConnected(voiceChannel); err != nil {
-        k.editInteractionError(ic, fmt.Sprintf("Failed to join voice channel: %v", err))
+        k.editInteractionError(ic, fmt.Sprintf("Неуспело повезивање на гласовни канал: %v", err))
         return
     }
 
@@ -195,13 +207,13 @@ func (k *Kvazar) fulfilPlay(ic *discordgo.InteractionCreate, query, voiceChannel
 
     track, err := k.resolver.Resolve(ctx, query, requestedBy, ic.ChannelID)
     if err != nil {
-        k.editInteractionError(ic, fmt.Sprintf("Could not resolve track: %v", err))
+        k.editInteractionError(ic, fmt.Sprintf("Не могу да пронађем песму: %v", err))
         return
     }
 
     position := player.Enqueue(track)
 
-    message := fmt.Sprintf("Queued **%s** — position #%d.", track.Title, position)
+    message := fmt.Sprintf("У реду **%s** — позиција #%d.", track.Title, position)
     embed := buildQueuedEmbed(track, position)
     embeds := []*discordgo.MessageEmbed{embed}
 
@@ -224,39 +236,165 @@ func (k *Kvazar) editInteractionError(ic *discordgo.InteractionCreate, message s
 }
 
 func (k *Kvazar) handleSkip(ic *discordgo.InteractionCreate) {
-    player := k.findPlayer(ic.GuildID)
-    if player == nil {
-        k.respondError(ic, "Nothing is playing right now.")
-        return
-    }
+	player := k.findPlayer(ic.GuildID)
+	if player == nil {
+		k.respondError(ic, "Ништа тренутно не свира.")
+		return
+	}
 
-    if !player.Skip() {
-        k.respondError(ic, "There is no active track to skip.")
-        return
-    }
+	if !player.Skip() {
+		k.respondError(ic, "Нема активне песме за прескакање.")
+		return
+	}
 
-    k.respondSuccess(ic, "Skipped the current track.")
+	k.respondSuccess(ic, "Прескочена је тренутна песма.")
+}
+
+func (k *Kvazar) handlePlayer(ic *discordgo.InteractionCreate) {
+	player := k.findPlayer(ic.GuildID)
+	if player == nil {
+		k.respondError(ic, "Ништа тренутно не свира.")
+		return
+	}
+
+	player.mu.Lock()
+	current := player.current
+	queueLen := len(player.queue)
+	loop := player.loop
+	paused := player.paused
+	player.mu.Unlock()
+
+	if current == nil {
+		k.respondError(ic, "Ништа тренутно не свира.")
+		return
+	}
+
+	embed := buildNowPlayingEmbed(current, loop)
+	
+	// Add queue info
+	if queueLen > 0 {
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:   "У реду",
+			Value:  fmt.Sprintf("%d песама", queueLen),
+			Inline: true,
+		})
+	}
+	
+	// Add pause state
+	if paused {
+		embed.Color = 0xFFA500 // Orange for paused
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:   "Статус",
+			Value:  "⏸️ Паузирано",
+			Inline: true,
+		})
+	}
+
+	// Add control buttons
+	loopLabel := "Укључи понављање"
+	loopStyle := discordgo.SecondaryButton
+	if loop {
+		loopLabel = "Искључи понављање"
+		loopStyle = discordgo.SuccessButton
+	}
+
+	components := []discordgo.MessageComponent{
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					Label:    "Пауза",
+					Style:    discordgo.SecondaryButton,
+					CustomID: "pause_button",
+					Emoji: discordgo.ComponentEmoji{
+						Name: "⏸️",
+					},
+				},
+				discordgo.Button{
+					Label:    "Заустави",
+					Style:    discordgo.DangerButton,
+					CustomID: "stop_button",
+					Emoji: discordgo.ComponentEmoji{
+						Name: "⏹️",
+					},
+				},
+				discordgo.Button{
+					Label:    "Прескочи",
+					Style:    discordgo.PrimaryButton,
+					CustomID: "skip_button",
+					Emoji: discordgo.ComponentEmoji{
+						Name: "⏭️",
+					},
+				},
+				discordgo.Button{
+					Label:    loopLabel,
+					Style:    loopStyle,
+					CustomID: "loop_button",
+					Emoji: discordgo.ComponentEmoji{
+						Name: "🔁",
+					},
+				},
+			},
+		},
+	}
+
+	_ = k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds:     []*discordgo.MessageEmbed{embed},
+			Components: components,
+		},
+	})
+}
+
+func (k *Kvazar) handlePause(ic *discordgo.InteractionCreate) {
+	player := k.findPlayer(ic.GuildID)
+	if player == nil {
+		k.respondError(ic, "Ништа тренутно не свира.")
+		return
+	}
+
+	paused := player.Pause()
+	if paused {
+		k.respondSuccess(ic, "⏸️ Репродукција паузирана.")
+	} else {
+		k.respondSuccess(ic, "▶️ Репродукција настављена.")
+	}
+}
+
+func (k *Kvazar) handleStop(ic *discordgo.InteractionCreate) {
+	player := k.findPlayer(ic.GuildID)
+	if player == nil {
+		k.respondError(ic, "Ништа тренутно не свира.")
+		return
+	}
+
+	if !player.Stop() {
+		k.respondError(ic, "Нема ничега за заустављање.")
+		return
+	}
+
+	k.respondSuccess(ic, "⏹️ Репродукција заустављена и ред испражњен.")
 }
 
 func (k *Kvazar) handleLoop(ic *discordgo.InteractionCreate) {
-    player := k.findPlayer(ic.GuildID)
-    if player == nil {
-        k.respondError(ic, "Nothing is playing to loop.")
-        return
-    }
+	player := k.findPlayer(ic.GuildID)
+	if player == nil {
+		k.respondError(ic, "Ништа не свира да би се понављало.")
+		return
+	}
+	
+	var explicit *bool
+	if len(ic.ApplicationCommandData().Options) > 0 {
+		value := ic.ApplicationCommandData().Options[0].BoolValue()
+		explicit = &value
+	}
 
-    var explicit *bool
-    if len(ic.ApplicationCommandData().Options) > 0 {
-        value := ic.ApplicationCommandData().Options[0].BoolValue()
-        explicit = &value
-    }
-
-    state := player.ToggleLoop(explicit)
-    if state {
-        k.respondSuccess(ic, "Loop enabled for the current track.")
-    } else {
-        k.respondSuccess(ic, "Loop disabled.")
-    }
+	state := player.ToggleLoop(explicit)
+	if state {
+		k.respondSuccess(ic, "Понављање је укључено.")
+	} else {
+		k.respondSuccess(ic, "Понављање је искључено.")
+	}
 }
 
 func (k *Kvazar) respondError(ic *discordgo.InteractionCreate, message string) {
@@ -314,8 +452,135 @@ func (k *Kvazar) announceNowPlaying(track *media.Track, loop bool) {
         return
     }
     embed := buildNowPlayingEmbed(track, loop)
-    if _, err := k.session.ChannelMessageSendEmbed(track.RequestChannelID, embed); err != nil {
+    
+    // Add buttons for skip and loop
+    loopLabel := "Понови"
+    loopStyle := discordgo.SecondaryButton
+    if loop {
+        loopLabel = "Искључи понављање"
+        loopStyle = discordgo.SuccessButton
+    }
+    
+    components := []discordgo.MessageComponent{
+        discordgo.ActionsRow{
+            Components: []discordgo.MessageComponent{
+                discordgo.Button{
+                    Label:    "Пауза",
+                    Style:    discordgo.SecondaryButton,
+                    CustomID: "pause_button",
+                    Emoji: discordgo.ComponentEmoji{
+                        Name: "⏸️",
+                    },
+                },
+                discordgo.Button{
+                    Label:    "Заустави",
+                    Style:    discordgo.DangerButton,
+                    CustomID: "stop_button",
+                    Emoji: discordgo.ComponentEmoji{
+                        Name: "⏹️",
+                    },
+                },
+                discordgo.Button{
+                    Label:    "Прескочи",
+                    Style:    discordgo.PrimaryButton,
+                    CustomID: "skip_button",
+                    Emoji: discordgo.ComponentEmoji{
+                        Name: "⏭️",
+                    },
+                },
+                discordgo.Button{
+                    Label:    loopLabel,
+                    Style:    loopStyle,
+                    CustomID: "loop_button",
+                    Emoji: discordgo.ComponentEmoji{
+                        Name: "🔁",
+                    },
+                },
+            },
+        },
+    }
+    
+    if _, err := k.session.ChannelMessageSendComplex(track.RequestChannelID, &discordgo.MessageSend{
+        Embeds:     []*discordgo.MessageEmbed{embed},
+        Components: components,
+    }); err != nil {
         log.Printf("failed to send now playing message: %v", err)
+    }
+}
+
+func (k *Kvazar) handleButtonClick(ic *discordgo.InteractionCreate) {
+    customID := ic.MessageComponentData().CustomID
+    
+    player := k.findPlayer(ic.GuildID)
+    if player == nil {
+        _ = k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+            Type: discordgo.InteractionResponseChannelMessageWithSource,
+            Data: &discordgo.InteractionResponseData{
+                Content: "Ништа тренутно не свира.",
+                Flags:   discordgo.MessageFlagsEphemeral,
+            },
+        })
+        return
+    }
+    
+    switch customID {
+    case "pause_button":
+        _ = k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+            Type: discordgo.InteractionResponseDeferredMessageUpdate,
+        })
+        paused := player.Pause()
+        message := "⏸️ Репродукција паузирана."
+        if !paused {
+            message = "▶️ Репродукција настављена."
+        }
+        _, _ = k.session.FollowupMessageCreate(ic.Interaction, true, &discordgo.WebhookParams{
+            Content: message,
+            Flags:   discordgo.MessageFlagsEphemeral,
+        })
+    case "stop_button":
+        _ = k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+            Type: discordgo.InteractionResponseDeferredMessageUpdate,
+        })
+        if player.Stop() {
+            _, _ = k.session.FollowupMessageCreate(ic.Interaction, true, &discordgo.WebhookParams{
+                Content: "⏹️ Репродукција заустављена и ред испражњен.",
+                Flags:   discordgo.MessageFlagsEphemeral,
+            })
+        } else {
+            _, _ = k.session.FollowupMessageCreate(ic.Interaction, true, &discordgo.WebhookParams{
+                Content: "Нема ничега за заустављање.",
+                Flags:   discordgo.MessageFlagsEphemeral,
+            })
+        }
+    case "skip_button":
+        _ = k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+            Type: discordgo.InteractionResponseDeferredMessageUpdate,
+        })
+        if player.Skip() {
+            _, _ = k.session.FollowupMessageCreate(ic.Interaction, true, &discordgo.WebhookParams{
+                Content: "⏭️ Прескочена је тренутна песма.",
+                Flags:   discordgo.MessageFlagsEphemeral,
+            })
+        } else {
+            _, _ = k.session.FollowupMessageCreate(ic.Interaction, true, &discordgo.WebhookParams{
+                Content: "Нема активне песме за прескакање.",
+                Flags:   discordgo.MessageFlagsEphemeral,
+            })
+        }
+    case "loop_button":
+        _ = k.session.InteractionRespond(ic.Interaction, &discordgo.InteractionResponse{
+            Type: discordgo.InteractionResponseDeferredMessageUpdate,
+        })
+        state := player.ToggleLoop(nil)
+        emoji := "🔁"
+        message := "Понављање је укључено."
+        if !state {
+            message = "Понављање је искључено."
+        }
+        _, _ = k.session.FollowupMessageCreate(ic.Interaction, true, &discordgo.WebhookParams{
+            Content: emoji + " " + message,
+            Flags:   discordgo.MessageFlagsEphemeral,
+        })
     }
 }
 
@@ -327,52 +592,49 @@ func pickOrDefault(value, fallback string) string {
 }
 
 func buildQueuedEmbed(track *media.Track, position int) *discordgo.MessageEmbed {
-    title := fmt.Sprintf("Queued • %s", track.Title)
+    title := fmt.Sprintf("У реду • %s", track.Title)
     if position == 1 {
-        title = fmt.Sprintf("Up next • %s", track.Title)
+        title = fmt.Sprintf("Следеће • %s", track.Title)
     }
 
     fields := []*discordgo.MessageEmbedField{
-        {Name: "Length", Value: track.HumanDuration(), Inline: true},
-        {Name: "Source", Value: string(track.Source), Inline: true},
+        {Name: "Трајање", Value: track.HumanDuration(), Inline: true},
+        {Name: "Извор", Value: string(track.Source), Inline: true},
     }
     if track.RequestedBy != "" {
-        fields = append(fields, &discordgo.MessageEmbedField{Name: "Requested by", Value: track.RequestedBy, Inline: true})
+        fields = append(fields, &discordgo.MessageEmbedField{Name: "Захтевао", Value: track.RequestedBy, Inline: true})
     }
-    fields = append(fields, &discordgo.MessageEmbedField{Name: "Position", Value: fmt.Sprintf("#%d", position), Inline: true})
+    fields = append(fields, &discordgo.MessageEmbedField{Name: "Позиција", Value: fmt.Sprintf("#%d", position), Inline: true})
 
-    return &discordgo.MessageEmbed{
-        Title:       title,
-        URL:         track.WebURL,
-        Description: "Kvazar keeps your session light and focused.",
-        Color:       0x5865F2,
-        Timestamp:   time.Now().UTC().Format(time.RFC3339),
-        Thumbnail: &discordgo.MessageEmbedThumbnail{
-            URL: track.Thumbnail,
-        },
-        Fields: fields,
-        Footer: &discordgo.MessageEmbedFooter{Text: "Kvazar • minimal music companion"},
-    }
+	return &discordgo.MessageEmbed{
+		Title:     title,
+		URL:       track.WebURL,
+		Color:     0x5865F2,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Thumbnail: &discordgo.MessageEmbedThumbnail{
+			URL: track.Thumbnail,
+		},
+		Fields: fields,
+	}
 }
 
 func buildNowPlayingEmbed(track *media.Track, loop bool) *discordgo.MessageEmbed {
-    status := "Now playing"
+    status := "Сада"
     if loop {
-        status = "Looping"
+        status = "Понавља"
     }
 
-    return &discordgo.MessageEmbed{
-        Title:     fmt.Sprintf("%s • %s", status, track.Title),
-        URL:       track.WebURL,
-        Color:     0x1ABC9C,
-        Timestamp: time.Now().UTC().Format(time.RFC3339),
-        Thumbnail: &discordgo.MessageEmbedThumbnail{URL: track.Thumbnail},
-        Fields: []*discordgo.MessageEmbedField{
-            {Name: "Length", Value: track.HumanDuration(), Inline: true},
-            {Name: "Source", Value: string(track.Source), Inline: true},
-        },
-        Footer: &discordgo.MessageEmbedFooter{Text: "Kvazar • stay in flow"},
-    }
+	return &discordgo.MessageEmbed{
+		Title:     fmt.Sprintf("%s • %s", status, track.Title),
+		URL:       track.WebURL,
+		Color:     0x1ABC9C,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Thumbnail: &discordgo.MessageEmbedThumbnail{URL: track.Thumbnail},
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Трајање", Value: track.HumanDuration(), Inline: true},
+			{Name: "Извор", Value: string(track.Source), Inline: true},
+		},
+	}
 }
 
 func stringPtr(value string) *string {

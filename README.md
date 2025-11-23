@@ -41,22 +41,61 @@ Kvazar is configured using environment variables:
 
 When `/play` resolves a track successfully, Kvazar will queue it, inform the requester privately, and broadcast a minimalist "Now Playing" card to the invoking channel when playback starts.
 
-## Running locally
+## Running with Docker (Recommended)
 
-1. Export your token and ensure dependencies are installed:
+1. Create a `.env` file from the example:
 
    ```bash
-   export KVZ_DISCORD_TOKEN=your_token_here
+   cp .env.example .env
+   ```
+
+2. Edit `.env` and add your Discord bot token:
+
+   ```bash
+   KVZ_DISCORD_TOKEN=your_discord_bot_token_here
+   ```
+
+3. Start the bot with Docker Compose:
+
+   ```bash
+   docker-compose up -d
+   ```
+
+4. View logs:
+
+   ```bash
+   docker-compose logs -f kvazar
+   ```
+
+5. Stop the bot:
+
+   ```bash
+   docker-compose down
+   ```
+
+The Docker image includes all required dependencies (ffmpeg and yt-dlp) pre-installed.
+
+## Running locally (without Docker)
+
+1. Ensure dependencies are installed:
+
+   ```bash
    which ffmpeg yt-dlp
    ```
 
-2. Start the bot:
+2. Export your token:
+
+   ```bash
+   export KVZ_DISCORD_TOKEN=your_token_here
+   ```
+
+3. Start the bot:
 
    ```bash
    go run ./cmd/kvazar
    ```
 
-3. Invite the bot to your server with the `applications.commands` and `bot` scopes, granting it permission to connect and speak in voice channels.
+4. Invite the bot to your server with the `applications.commands` and `bot` scopes, granting it permission to connect and speak in voice channels.
 
 Kvazar listens for `SIGINT`/`SIGTERM` and will gracefully close the Discord session on shutdown, cleaning up registered slash commands.
 

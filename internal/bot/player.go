@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/pion/opus/v2"
+	"layeh.com/gopus"
 
 	"kvazar/internal/media"
 )
@@ -24,6 +24,7 @@ const (
 	pcmFrameSize      = 960 // 20ms at 48kHz
 	pcmChannelCount   = 2
 	sampleRate        = 48000
+	opusBitrate       = 128000 // 128 kbps for high quality
 	opusFrameCapacity = 4096
 	disconnectDelay   = 90 * time.Second
 )
@@ -38,8 +39,10 @@ type Player struct {
 	current        *media.Track
 	loop           bool
 	playing        bool
+	paused         bool
 	skipRequested  bool
 	cancelPlayback context.CancelFunc
+	pauseChan      chan bool
 
 	voice           *discordgo.VoiceConnection
 	disconnectTimer *time.Timer
@@ -107,6 +110,39 @@ func (p *Player) Skip() bool {
 	return active
 }
 
+// Pause toggles the pause state. Returns true if now paused, false if resumed.
+func (p *Player) Pause() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	if !p.playing || p.current == nil {
+		return false
+	}
+	
+	p.paused = !p.paused
+	if p.pauseChan != nil {
+		p.pauseChan <- p.paused
+	}
+	return p.paused
+}
+
+// Stop clears the queue and stops playback.
+func (p *Player) Stop() bool {
+	p.mu.Lock()
+	cancel := p.cancelPlayback
+	hadContent := p.current != nil || len(p.queue) > 0
+	p.queue = nil
+	p.current = nil
+	p.loop = false
+	p.paused = false
+	if cancel != nil {
+		p.skipRequested = true
+		cancel()
+	}
+	p.mu.Unlock()
+	return hadContent
+}
+
 // ToggleLoop toggles or explicitly sets loop state, returning the resulting value.
 func (p *Player) ToggleLoop(explicit *bool) bool {
 	p.mu.Lock()
@@ -141,6 +177,7 @@ func (p *Player) playLoop() {
 		if track == nil {
 			p.mu.Lock()
 			p.playing = false
+			p.paused = false
 			p.scheduleDisconnectLocked()
 			p.mu.Unlock()
 			return
@@ -153,14 +190,15 @@ func (p *Player) playLoop() {
 		ctx, cancel := context.WithCancel(context.Background())
 		p.mu.Lock()
 		p.cancelPlayback = cancel
+		p.pauseChan = make(chan bool, 1)
 		p.mu.Unlock()
 
 		err := p.streamTrack(ctx, track)
 
 		p.mu.Lock()
-		if p.cancelPlayback == cancel {
-			p.cancelPlayback = nil
-		}
+		// Clear the cancel function after playback
+		p.cancelPlayback = nil
+		p.pauseChan = nil
 		p.mu.Unlock()
 
 		if errors.Is(err, context.Canceled) {
@@ -177,11 +215,12 @@ func (p *Player) nextTrack() (*media.Track, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.loop && p.current != nil && !p.skipRequested {
-		return p.current, true
-	}
-
 	p.skipRequested = false
+
+	// If loop is enabled and we have a current track, add it back to the queue
+	if p.loop && p.current != nil {
+		p.queue = append(p.queue, p.current)
+	}
 
 	if len(p.queue) == 0 {
 		p.current = nil
@@ -203,10 +242,13 @@ func (p *Player) streamTrack(ctx context.Context, track *media.Track) error {
 		return errors.New("voice connection not established")
 	}
 
-	opusEncoder, err := opus.NewEncoder(sampleRate, pcmChannelCount, opus.AppAudio)
+	opusEncoder, err := gopus.NewEncoder(sampleRate, pcmChannelCount, gopus.Audio)
 	if err != nil {
 		return fmt.Errorf("opus encoder: %w", err)
 	}
+	
+	// Set high quality bitrate
+	opusEncoder.SetBitrate(opusBitrate)
 
 	cmdArgs := buildFFMpegArgs(track)
 	cmd := exec.CommandContext(ctx, p.bot.ffmpegPath, cmdArgs...)
@@ -231,7 +273,6 @@ func (p *Player) streamTrack(ctx context.Context, track *media.Track) error {
 	reader := bufio.NewReader(stdout)
 	pcmBuf := make([]int16, pcmFrameSize*pcmChannelCount)
 	byteBuf := make([]byte, len(pcmBuf)*2)
-	opusBuf := make([]byte, opusFrameCapacity)
 
 	if err := vc.Speaking(true); err != nil {
 		log.Printf("failed to set speaking state: %v", err)
@@ -247,6 +288,26 @@ func (p *Player) streamTrack(ctx context.Context, track *media.Track) error {
 			return context.Canceled
 		}
 
+		// Handle pause state
+		p.mu.Lock()
+		pauseChan := p.pauseChan
+		isPaused := p.paused
+		p.mu.Unlock()
+
+		if isPaused {
+			select {
+			case <-ctx.Done():
+				return context.Canceled
+			case paused := <-pauseChan:
+				if !paused {
+					// Resumed, continue
+					continue
+				}
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+
 		if _, err := io.ReadFull(reader, byteBuf); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return nil
@@ -258,13 +319,10 @@ func (p *Player) streamTrack(ctx context.Context, track *media.Track) error {
 			pcmBuf[i] = int16(binary.LittleEndian.Uint16(byteBuf[i*2 : i*2+2]))
 		}
 
-		n, err := opusEncoder.Encode(pcmBuf, pcmFrameSize, opusBuf)
+		packet, err := opusEncoder.Encode(pcmBuf, pcmFrameSize, opusFrameCapacity)
 		if err != nil {
 			return fmt.Errorf("opus encode: %w", err)
 		}
-
-		packet := make([]byte, n)
-		copy(packet, opusBuf[:n])
 
 		select {
 		case <-ctx.Done():
@@ -315,6 +373,7 @@ func buildFFMpegArgs(track *media.Track) []string {
 	args = append(args,
 		"-i", track.StreamURL,
 		"-vn",
+		"-af", "loudnorm=I=-16:LRA=11:TP=-1.5", // Audio normalization for better quality
 		"-f", "s16le",
 		"-ac", fmt.Sprintf("%d", pcmChannelCount),
 		"-ar", fmt.Sprintf("%d", sampleRate),
