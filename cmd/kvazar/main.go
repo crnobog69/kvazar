@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -32,6 +34,13 @@ func main() {
 		log.Fatalf("kvazar: failed to open session: %v", err)
 	}
 
+	// Start health check HTTP server
+	port := os.Getenv("KVZ_HEALTH_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	go startHealthServer(port, instance)
+
 	log.Println("kvazar is online — press Ctrl+C to exit")
 
 	waitForShutdown()
@@ -58,4 +67,24 @@ func waitForShutdown() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	signal.Stop(sigCh)
+}
+
+func startHealthServer(port string, instance *bot.Kvazar) {
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"ok","service":"kvazar"}`)
+	})
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Kvazar Discord Bot - Health Check OK")
+	})
+
+	addr := ":" + port
+	log.Printf("Health check server listening on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Printf("Health check server error: %v", err)
+	}
 }
